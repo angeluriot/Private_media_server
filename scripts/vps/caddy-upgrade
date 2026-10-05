@@ -1,0 +1,21 @@
+#!/bin/bash
+# Updates Caddy with its plugins (apt would remove the Cloudflare plugin), see docs/16_updates.md
+set -euo pipefail
+
+binary=$(command -v caddy)
+before=$(caddy version)
+cp -p "$binary" "$binary.backup"
+
+caddy upgrade
+
+# Never keep a binary without the Cloudflare plugin, the next restart would break the certificates
+if ! caddy list-modules | grep -q dns.providers.cloudflare; then
+  mv "$binary.backup" "$binary"
+  echo "The new version doesn't have the Cloudflare plugin, the previous one has been restored"
+  exit 1
+fi
+rm "$binary.backup"
+
+if [ "$(caddy version)" != "$before" ]; then
+  systemctl restart caddy
+fi

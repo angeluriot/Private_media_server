@@ -1,0 +1,57 @@
+#!/bin/bash
+# Health checks of the VPS and of the local computer seen from the VPS, see docs/15_monitoring.md
+# Configuration: /etc/mediaserver-check.env (DISCORD_WEBHOOK_URL, DOMAIN)
+set -u
+
+: "${DISCORD_WEBHOOK_URL:?is missing in /etc/mediaserver-check.env}" "${DOMAIN:?is missing in /etc/mediaserver-check.env}"
+
+problems=()
+
+# Disk space
+usage=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+[ "$usage" -ge 90 ] && problems+=("Disk / is ${usage}% full")
+
+# Failed system services
+for unit in $(systemctl list-units --state=failed --no-legend --plain | awk '{print $1}'); do
+  problems+=("Service $unit has failed")
+done
+
+# Main services
+for service in caddy crowdsec crowdsec-firewall-bouncer wg-quick@wg0; do
+  systemctl is-active --quiet "$service" || problems+=("Service $service is not running")
+done
+
+# Local computer through the tunnel
+if ping -c 3 -W 2 10.10.0.2 > /dev/null 2>&1; then
+  curl -fs --max-time 15 -o /dev/null http://10.10.0.2:8096/health || problems+=("Jellyfin is unreachable")
+  curl -fs --max-time 15 -o /dev/null http://10.10.0.2:5055/api/v1/status || problems+=("Seerr is unreachable")
+else
+  problems+=("The local computer is unreachable through the tunnel")
+fi
+
+# Certificate renewal
+echo | openssl s_client -connect 127.0.0.1:443 -servername "tv.$DOMAIN" 2>/dev/null \
+  | openssl x509 -noout -checkend $((14 * 86400)) > /dev/null 2>&1 \
+  || problems+=("The TLS certificate can't be read or expires in less than 14 days")
+
+# Notification (only when the same state is seen twice in a row, to ignore short glitches)
+current=$(printf '%s\n' "${problems[@]}")
+previous=$(cat /var/lib/mediaserver-check/last_run 2>/dev/null)
+sent=$(cat /var/lib/mediaserver-check/last_sent 2>/dev/null)
+mkdir -p /var/lib/mediaserver-check
+printf '%s' "$current" > /var/lib/mediaserver-check/last_run
+echo "${current:-No problem detected}"
+
+if [ "$current" = "$previous" ] && [ "$current" != "$sent" ]; then
+  if [ -n "$current" ]; then
+    message="⚠️ **$(hostname): problem detected**"$'\n'"$current"
+  else
+    message="✅ **$(hostname): back to normal**"
+  fi
+  if jq -n --arg content "$message" '{content: $content}' \
+    | curl -fs --max-time 15 -o /dev/null -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"; then
+    printf '%s' "$current" > /var/lib/mediaserver-check/last_sent
+  fi
+fi
+
+exit 0

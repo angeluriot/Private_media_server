@@ -1,0 +1,197 @@
+#!/bin/bash
+# Container updates with backup and rollback, see docs/16_updates.md
+set -euo pipefail
+
+BACKUP_DIR=/data/backups
+BACKUPS_TO_KEEP=3
+GLUETUN_DEPENDENTS=(qbittorrent prowlarr byparr)
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  sudo mediaserver-update <service> <new_tag>    Back up a container and update it to a new version
+  sudo mediaserver-update --rollback <service>   Restore the last backup of a container
+  sudo mediaserver-update --patch                Apply the updates republished on the current tags
+USAGE
+  exit 1
+}
+
+notify() {
+  jq -n --arg content "$1" '{content: $content}' \
+    | curl -fs --max-time 15 -o /dev/null -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL" || true
+}
+
+service_image() {
+  docker compose config --format json | jq -r --arg s "$1" '.services[$s].image // empty'
+}
+
+# Change the image of a single service in the Docker Compose
+set_image() {
+  local service=$1 old=$2 new=$3 content
+  content=$(awk -v s="$service" -v old="$old" -v new="$new" '
+    /^[^ ]/ { current = "" }
+    /^  [^ #][^:]*:/ { current = $1; sub(/:$/, "", current) }
+    current == s && $1 == "image:" && $2 == old { sub(/image: .*/, "image: " new) }
+    { print }
+  ' docker-compose.yml)
+  printf '%s\n' "$content" > docker-compose.yml
+  if [ "$(service_image "$service")" != "$new" ]; then
+    echo "Could not change the image of $service in docker-compose.yml"
+    exit 1
+  fi
+}
+
+# A service and the ones using its network
+containers_of() {
+  if [ "$1" = gluetun ]; then
+    echo gluetun "${GLUETUN_DEPENDENTS[@]}"
+  else
+    echo "$1"
+  fi
+}
+
+# Wait up to 5 minutes for the containers to be running (and healthy when they have a health check),
+# the ones that are not are listed in NOT_HEALTHY
+wait_healthy() {
+  local container state
+  for _ in $(seq 1 30); do
+    NOT_HEALTHY=()
+    for container in "$@"; do
+      state=$(docker inspect -f '{{.State.Status}}{{if .State.Health}} {{.State.Health.Status}}{{end}}' "$container" 2>/dev/null || true)
+      if [ "$state" != "running" ] && [ "$state" != "running healthy" ]; then
+        NOT_HEALTHY+=("$container (${state:-missing})")
+      fi
+    done
+    if [ ${#NOT_HEALTHY[@]} -eq 0 ]; then
+      return 0
+    fi
+    sleep 10
+  done
+  return 1
+}
+
+start() {
+  local containers
+  containers=$(containers_of "$1")
+  docker compose up -d --force-recreate $containers
+  wait_healthy $containers
+}
+
+backup() {
+  local service=$1 image=$2 dir
+  dir="$BACKUP_DIR/$service-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$dir"
+  echo "$image" > "$dir/image"
+  docker compose stop "$service"
+  if [ -d "config/$service" ]; then
+    tar -czf "$dir/config.tar.gz" "config/$service"
+  fi
+  echo "Backup saved in $dir"
+
+  # Keep only the most recent backups of this service
+  ls -d "$BACKUP_DIR/$service"-*/ | sort | head -n -"$BACKUPS_TO_KEEP" | xargs -r rm -rf
+}
+
+update() {
+  local service=$1 tag=$2 old new
+  old=$(service_image "$service")
+  if [ -z "$old" ]; then
+    echo "Unknown service: $service"
+    exit 1
+  fi
+  new="${old%:*}:$tag"
+  if [ "$old" = "$new" ]; then
+    echo "$service already uses $new"
+    exit 1
+  fi
+  # Never go back to an older version by mistake, the rollback is there for that
+  if [ "$(printf '%s\n%s\n' "${old##*:}" "$tag" | sort -V | tail -1)" != "$tag" ]; then
+    echo "$tag is older than ${old##*:}, use --rollback to go back to the previous version"
+    exit 1
+  fi
+
+  # Download first, so nothing is stopped if the tag doesn't exist
+  docker pull "$new"
+  backup "$service" "$old"
+  set_image "$service" "$old" "$new"
+
+  if start "$service"; then
+    docker image prune -f > /dev/null
+    echo "✅ $service updated from $old to $new"
+  else
+    echo "⚠️ Not healthy after 5 minutes: ${NOT_HEALTHY[*]}, check the logs with: docker compose logs <container>"
+    echo "To go back to the previous version: sudo mediaserver-update --rollback $service"
+    exit 1
+  fi
+}
+
+rollback() {
+  local service=$1 dir old current
+  dir=$(ls -d "$BACKUP_DIR/$service"-*/ 2>/dev/null | sort | tail -1 || true)
+  if [ -z "$dir" ]; then
+    echo "No backup found for $service"
+    exit 1
+  fi
+  dir=${dir%/}
+  old=$(cat "$dir/image")
+  current=$(service_image "$service")
+
+  echo "Restoring $dir ($old)"
+  docker compose stop "$service"
+  if [ -f "$dir/config.tar.gz" ]; then
+    rm -rf "config/$service"
+    tar -xzf "$dir/config.tar.gz"
+  fi
+  if [ "$current" != "$old" ]; then
+    set_image "$service" "$current" "$old"
+  fi
+
+  if start "$service"; then
+    echo "✅ $service restored to $old"
+  else
+    echo "⚠️ Not healthy after 5 minutes: ${NOT_HEALTHY[*]}, check the logs with: docker compose logs <container>"
+    exit 1
+  fi
+}
+
+patch() {
+  local service running latest updated=()
+  docker compose pull --quiet
+
+  for service in $(docker compose config --services); do
+    running=$(docker inspect -f '{{.Image}}' "$service" 2>/dev/null || true)
+    latest=$(docker image inspect -f '{{.Id}}' "$(service_image "$service")")
+    if [ "$running" != "$latest" ]; then
+      updated+=("$service")
+    fi
+  done
+
+  if [ ${#updated[@]} -eq 0 ]; then
+    echo "Everything is up to date"
+  else
+    echo "Updating: ${updated[*]}"
+    if [[ " ${updated[*]} " == *" gluetun "* ]]; then
+      docker compose up -d --force-recreate gluetun "${GLUETUN_DEPENDENTS[@]}"
+    fi
+    docker compose up -d
+    if ! wait_healthy $(docker compose config --services); then
+      notify "⚠️ **$(hostname): containers not healthy after the automatic patches**"$'\n'"Not healthy: ${NOT_HEALTHY[*]}"$'\n'"Patched: ${updated[*]}"$'\n'"Check with \`docker compose ps\` and \`docker compose logs <service>\`"
+    fi
+    docker image prune -f > /dev/null
+  fi
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Run it with sudo"
+  exit 1
+fi
+
+cd /opt/mediaserver
+DISCORD_WEBHOOK_URL=$(grep '^DISCORD_WEBHOOK_URL=' .env | cut -d= -f2-)
+
+case "${1:-}" in
+  --patch) [ $# -eq 1 ] || usage; patch ;;
+  --rollback) [ $# -eq 2 ] || usage; rollback "$2" ;;
+  -* | "") usage ;;
+  *) [ $# -eq 2 ] || usage; update "$1" "$2" ;;
+esac

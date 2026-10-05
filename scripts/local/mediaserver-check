@@ -1,0 +1,68 @@
+#!/bin/bash
+# Health checks of the local computer, see docs/15_monitoring.md
+# Configuration: /etc/mediaserver-check.env (DISCORD_WEBHOOK_URL, DOMAIN, HDD_ID)
+set -u
+
+: "${DISCORD_WEBHOOK_URL:?is missing in /etc/mediaserver-check.env}" "${DOMAIN:?is missing in /etc/mediaserver-check.env}" "${HDD_ID:?is missing in /etc/mediaserver-check.env}"
+
+problems=()
+
+# Disk space
+for mount in / /data; do
+  usage=$(df --output=pcent "$mount" | tail -1 | tr -dc '0-9')
+  [ "$usage" -ge 90 ] && problems+=("Disk $mount is ${usage}% full")
+done
+
+# Hard drive health
+smartctl -H "/dev/disk/by-id/$HDD_ID" > /dev/null || problems+=("The hard drive SMART check failed")
+
+# Failed system services
+for unit in $(systemctl list-units --state=failed --no-legend --plain | awk '{print $1}'); do
+  problems+=("Service $unit has failed")
+done
+
+# Containers (every service of the Docker Compose)
+services=$(docker compose -f /opt/mediaserver/docker-compose.yml config --services 2>/dev/null)
+[ -n "$services" ] || problems+=("Could not read /opt/mediaserver/docker-compose.yml")
+for container in $services; do
+  state=$(docker inspect -f '{{.State.Status}}{{if .State.Health}} {{.State.Health.Status}}{{end}}' "$container" 2>/dev/null)
+  case "$state" in
+    "running" | "running healthy") ;;
+    "") problems+=("Container $container is missing") ;;
+    "running "*) problems+=("Container $container is ${state#running }") ;;
+    *) problems+=("Container $container is ${state%% *}") ;;
+  esac
+done
+
+# VPN port forwarding
+port=$(cat /opt/mediaserver/config/gluetun/forwarded_port 2>/dev/null)
+[ -n "$port" ] && [ "$port" != "0" ] || problems+=("No port is forwarded by the VPN")
+
+# Tunnel to the VPS
+ping -c 3 -W 2 10.10.0.1 > /dev/null 2>&1 || problems+=("The WireGuard tunnel to the VPS is down")
+
+# Public access (DNS, VPS, certificate, tunnel and services)
+curl -fs --max-time 15 -o /dev/null "https://tv.$DOMAIN/health" || problems+=("tv.$DOMAIN is unreachable")
+curl -fs --max-time 15 -o /dev/null "https://request.$DOMAIN/api/v1/status" || problems+=("request.$DOMAIN is unreachable")
+
+# Notification (only when the same state is seen twice in a row, to ignore short glitches)
+current=$(printf '%s\n' "${problems[@]}")
+previous=$(cat /var/lib/mediaserver-check/last_run 2>/dev/null)
+sent=$(cat /var/lib/mediaserver-check/last_sent 2>/dev/null)
+mkdir -p /var/lib/mediaserver-check
+printf '%s' "$current" > /var/lib/mediaserver-check/last_run
+echo "${current:-No problem detected}"
+
+if [ "$current" = "$previous" ] && [ "$current" != "$sent" ]; then
+  if [ -n "$current" ]; then
+    message="⚠️ **$(hostname): problem detected**"$'\n'"$current"
+  else
+    message="✅ **$(hostname): back to normal**"
+  fi
+  if jq -n --arg content "$message" '{content: $content}' \
+    | curl -fs --max-time 15 -o /dev/null -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"; then
+    printf '%s' "$current" > /var/lib/mediaserver-check/last_sent
+  fi
+fi
+
+exit 0

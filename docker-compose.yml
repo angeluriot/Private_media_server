@@ -1,0 +1,395 @@
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:10.11
+    container_name: jellyfin
+    hostname: <A_NAME_FOR_YOUR_MEDIA_SERVER>
+    user: "${PUID}:${PGID}"
+    group_add:
+      - "${RENDER_GID}"
+    restart: unless-stopped
+    networks:
+      - media
+    environment:
+      - TZ=${TZ}
+      - JELLYFIN_PublishedServerUrl=https://tv.<YOUR_DOMAIN>
+    ports:
+      - "8096:8096/tcp"
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    volumes:
+      - /opt/mediaserver/config/jellyfin:/config
+      - /opt/mediaserver/cache/jellyfin:/cache
+      - type: bind
+        source: /data/media
+        target: /data/media
+        read_only: true
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - wud.tag.include=^\d+\.\d+$$
+      - wud.link.template=https://github.com/jellyfin/jellyfin/releases
+  gluetun:
+    image: qmcgaw/gluetun:v3.41
+    container_name: gluetun
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      - media
+    ports:
+      - "127.0.0.1:8000:8000/tcp"
+      - "8080:8080/tcp"
+      - "9696:9696/tcp"
+      - "127.0.0.1:8191:8191/tcp"
+    volumes:
+      - /opt/mediaserver/config/gluetun:/gluetun
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${PROTON_WIREGUARD_PRIVATE_KEY}
+      - SERVER_COUNTRIES=${VPN_SERVER_COUNTRIES}
+      - PORT_FORWARD_ONLY=on
+      - VPN_PORT_FORWARDING=on
+      - VPN_PORT_FORWARDING_PROVIDER=protonvpn
+      - VPN_PORT_FORWARDING_STATUS_FILE=/gluetun/forwarded_port
+      - 'HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={"auth":"apikey","apikey":"${GLUETUN_API_KEY}"}'
+      - FIREWALL_OUTBOUND_SUBNETS=172.20.0.0/24
+      - UPDATER_PERIOD=0
+      - >-
+        VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c 'wget -qO-
+        --retry-connrefused --waitretry=2 --timeout=15
+        --post-data="json={\"listen_port\":{{PORTS}},\"current_network_interface\":\"{{VPN_INTERFACE}}\",\"random_port\":false,\"upnp\":false}"
+        http://127.0.0.1:8080/api/v2/app/setPreferences'
+      - >-
+        VPN_PORT_FORWARDING_DOWN_COMMAND=/bin/sh -c 'wget -qO-
+        --post-data="json={\"listen_port\":0}"
+        http://127.0.0.1:8080/api/v2/app/setPreferences'
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9999 >/dev/null || exit 1"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - wud.tag.include=^v\d+\.\d+$$
+      - wud.link.template=https://github.com/qdm12/gluetun/releases
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:5.2.3
+    container_name: qbittorrent
+    restart: unless-stopped
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - UMASK=002
+      - WEBUI_PORT=8080
+    volumes:
+      - /opt/mediaserver/config/qbittorrent:/config
+      - /data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/ || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - wud.tag.include=^\d\.\d+\.\d+$$
+      - wud.link.template=https://www.qbittorrent.org/news
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:version-2.5.2.5491
+    container_name: prowlarr
+    restart: unless-stopped
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - UMASK=002
+    volumes:
+      - /opt/mediaserver/config/prowlarr:/config
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:9696/ping || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - wud.tag.include=^version-\d+\.\d+\.\d+\.\d+$$
+      - wud.tag.transform=^version-(\d+\.\d+\.\d+)\.(\d+)$$ => $$1-$$2
+      - wud.link.template=https://github.com/Prowlarr/Prowlarr/releases
+  byparr:
+    image: ghcr.io/thephaseless/byparr:3.0
+    container_name: byparr
+    restart: unless-stopped
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    shm_size: 512mb
+    environment:
+      - TZ=${TZ}
+      - LOG_LEVEL=info
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - wud.tag.include=^\d+\.\d+$$
+      - wud.link.template=https://github.com/ThePhaseless/Byparr/releases
+  radarr:
+    image: lscr.io/linuxserver/radarr:version-6.3.0.10514
+    container_name: radarr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    networks:
+      media:
+        ipv4_address: 172.20.0.20
+    ports:
+      - "7878:7878/tcp"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - UMASK=002
+    volumes:
+      - /opt/mediaserver/config/radarr:/config
+      - /data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:7878/ping || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - wud.tag.include=^version-\d+\.\d+\.\d+\.\d+$$
+      - wud.tag.transform=^version-(\d+\.\d+\.\d+)\.(\d+)$$ => $$1-$$2
+      - wud.link.template=https://github.com/Radarr/Radarr/releases
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:version-4.0.19.2979
+    container_name: sonarr
+    restart: unless-stopped
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    networks:
+      media:
+        ipv4_address: 172.20.0.21
+    ports:
+      - "8989:8989/tcp"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - UMASK=002
+    volumes:
+      - /opt/mediaserver/config/sonarr:/config
+      - /data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8989/ping || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - wud.tag.include=^version-\d+\.\d+\.\d+\.\d+$$
+      - wud.tag.transform=^version-(\d+\.\d+\.\d+)\.(\d+)$$ => $$1-$$2
+      - wud.link.template=https://github.com/Sonarr/Sonarr/releases
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:version-v1.6.1
+    container_name: bazarr
+    restart: unless-stopped
+    depends_on:
+      radarr:
+        condition: service_healthy
+      sonarr:
+        condition: service_healthy
+    networks:
+      - media
+    ports:
+      - "6767:6767/tcp"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - UMASK=002
+    volumes:
+      - /opt/mediaserver/config/bazarr:/config
+      - /data/media:/data/media
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:6767/ || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - wud.tag.include=^version-v\d+\.\d+\.\d+$$
+      - wud.link.template=https://github.com/morpheus65535/bazarr/releases
+  seerr:
+    image: ghcr.io/seerr-team/seerr:v3.4
+    container_name: seerr
+    init: true
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    depends_on:
+      radarr:
+        condition: service_healthy
+      sonarr:
+        condition: service_healthy
+    networks:
+      - media
+    ports:
+      - "5055:5055/tcp"
+    environment:
+      - TZ=${TZ}
+      - LOG_LEVEL=info
+      - PORT=5055
+    volumes:
+      - /opt/mediaserver/config/seerr:/app/config
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:5055/api/v1/settings/public || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - wud.tag.include=^v\d+\.\d+$$
+      - wud.link.template=https://github.com/seerr-team/seerr/releases
+  wud:
+    image: getwud/wud:9.2
+    container_name: wud
+    restart: unless-stopped
+    networks:
+      - media
+    ports:
+      - "3000:3000/tcp"
+    environment:
+      - TZ=${TZ}
+      - WUD_AUTH_ADMIN_USER=admin
+      - WUD_AUTH_ADMIN_PASSWORD=${WUD_ADMIN_PASSWORD}
+      - WUD_WATCHER_LOCAL_CRON=0 */6 * * *
+      - WUD_WATCHER_LOCAL_WATCHDIGESTDEFAULT=false
+      - WUD_TRIGGER_DISCORD_MEDIASERVER_URL=${DISCORD_WEBHOOK_URL}
+      - WUD_TRIGGER_DISCORD_MEDIASERVER_ONDIGEST=false
+      - WUD_TRIGGER_DISCORD_MEDIASERVER_CARDLABEL=Update
+      - "WUD_TRIGGER_DISCORD_MEDIASERVER_SIMPLETITLE=🆕 $${container.name}: new version $${container.updateKind.remoteValue}"
+      - |-
+        WUD_TRIGGER_DISCORD_MEDIASERVER_SIMPLEBODY=Release notes: $${container.result.link}
+        Command: \`sudo mediaserver-update $${container.name} $${container.updateKind.remoteValue}\`
+    volumes:
+      - /opt/mediaserver/config/wud:/store
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - wud.tag.include=^\d+\.\d+$$
+      - wud.link.template=https://github.com/getwud/wud/releases
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+networks:
+  media:
+    name: media
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
